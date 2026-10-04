@@ -1,0 +1,12 @@
+[Unit]
+Description=Restart YOWU-4GS audio stream when the wireless headset connects
+After=pipewire.service
+Wants=pipewire.service
+
+[Service]
+ExecStart=@BINDIR@/yowu-headsetd
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

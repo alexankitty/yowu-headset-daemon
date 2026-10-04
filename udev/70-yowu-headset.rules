@@ -1,0 +1,5 @@
+# YOWU-4GS wireless headset dongle (1908:5566).
+# Let the logged-in user read the dongle's HID nodes so yowu-headsetd can see
+# headset connect/disconnect reports without root. Must sort before
+# 73-seat-late.rules for the uaccess tag to take effect.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1908", ATTRS{idProduct}=="5566", TAG+="uaccess"

@@ -1,0 +1,8 @@
+*.apk
+__pycache__/
+captures/**
+build/
+# makepkg output
+packaging/arch/pkg/
+packaging/arch/src/
+packaging/arch/*.pkg.tar.*

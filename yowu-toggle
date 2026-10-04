@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""Toggle the default audio output between the YOWU-4GS headset and another sink.
+
+Meant for a hotkey: each run flips the default output and shows a desktop
+notification. Choose the non-headset output once with `yowu-toggle set-other`;
+it's saved in ~/.config/yowu-headset/headsetd.conf under [toggle].
+
+Works natively on PipeWire: the default is read with pw-dump and set with
+pw-metadata (default.configured.audio.sink, as `wpctl set-default` does).
+WirePlumber then moves the streams that follow the default output.
+"""
+import argparse
+import configparser
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+HEADSET_PREFIX = "alsa_output.usb-YOWU_YOWU-4GS_"
+SYSTEM_CONFIG_PATH = "/etc/yowu-headset/headsetd.conf"
+CONFIG_PATH = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                           "yowu-headset", "headsetd.conf")
+NOTIFY_HINT = "string:x-canonical-private-synchronous:yowu-toggle"
+
+
+class ToggleError(Exception):
+    pass
+
+
+def pw_dump():
+    try:
+        out = subprocess.run(["pw-dump"], capture_output=True, text=True, check=True).stdout
+        return json.loads(out)
+    except (OSError, subprocess.CalledProcessError, ValueError) as e:
+        raise ToggleError(f"can't read the PipeWire graph (pw-dump): {e}")
+
+
+def sinks(objects):
+    """Return {node.name: description} for all audio output sinks."""
+    result = {}
+    for obj in objects:
+        if obj.get("type") != "PipeWire:Interface:Node":
+            continue
+        props = (obj.get("info") or {}).get("props") or {}
+        if props.get("media.class") == "Audio/Sink" and props.get("node.name"):
+            result[props["node.name"]] = props.get("node.description") or props["node.name"]
+    return result
+
+
+def default_sink(objects):
+    """node.name of the current default output, or None."""
+    for obj in objects:
+        if (obj.get("type") == "PipeWire:Interface:Metadata"
+                and (obj.get("props") or {}).get("metadata.name") == "default"):
+            for entry in obj.get("metadata") or []:
+                if entry.get("key") == "default.audio.sink":
+                    value = entry.get("value")
+                    if isinstance(value, str):
+                        value = json.loads(value)
+                    return (value or {}).get("name")
+    return None
+
+
+def headset_sink(all_sinks):
+    return next((name for name in all_sinks if name.startswith(HEADSET_PREFIX)), None)
+
+
+def set_default(name):
+    r = subprocess.run(["pw-metadata", "-n", "default", "0", "default.configured.audio.sink",
+                        json.dumps({"name": name}), "Spa:String:JSON"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise ToggleError(f"pw-metadata failed: {(r.stderr or r.stdout).strip()}")
+
+
+def load_config():
+    cfg = configparser.ConfigParser()
+    cfg.read_dict({"toggle": {"other_sink": "", "notify": "true"}})
+    cfg.read([SYSTEM_CONFIG_PATH, CONFIG_PATH])
+    return cfg
+
+
+def save_other_sink(name):
+    """Set [toggle] other_sink in the user config, keeping everything else as is."""
+    lines = []
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH) as f:
+            lines = f.read().splitlines()
+
+    section_start = next((i for i, l in enumerate(lines) if l.strip() == "[toggle]"), None)
+    if section_start is None:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines += ["[toggle]",
+                  "# Non-headset output for yowu-toggle (a PipeWire node.name).",
+                  f"other_sink = {name}"]
+    else:
+        section_end = next((i for i in range(section_start + 1, len(lines))
+                            if lines[i].lstrip().startswith("[")), len(lines))
+        for i in range(section_start + 1, section_end):
+            key = lines[i].split("=", 1)[0].strip()
+            if "=" in lines[i] and key == "other_sink" and not lines[i].lstrip().startswith("#"):
+                lines[i] = f"other_sink = {name}"
+                break
+        else:
+            while section_end > section_start + 1 and not lines[section_end - 1].strip():
+                section_end -= 1
+            lines.insert(section_end, f"other_sink = {name}")
+
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def notify(cfg, args, summary, body="", icon="audio-volume-high"):
+    if args.quiet or not cfg.getboolean("toggle", "notify", fallback=True):
+        return
+    if not shutil.which("notify-send"):
+        return
+    subprocess.run(["notify-send", "-a", "yowu-toggle", "-i", icon, "-h", NOTIFY_HINT,
+                    "-t", "2000", summary, body], check=False)
+
+
+def switch(target, objects, cfg, args):
+    all_sinks = sinks(objects)
+    headset = headset_sink(all_sinks)
+    other = cfg.get("toggle", "other_sink").strip()
+    current = default_sink(objects)
+
+    if target == "toggle":
+        target = "other" if current == headset and headset else "headset"
+
+    if target == "headset":
+        if not headset:
+            raise ToggleError("the YOWU-4GS headset output isn't available; is the dongle plugged in?")
+        name, icon = headset, "audio-headphones"
+    else:
+        if not other:
+            raise ToggleError("no non-headset output configured; run: yowu-toggle set-other")
+        if other not in all_sinks:
+            raise ToggleError(f"configured output {other!r} isn't available right now")
+        name, icon = other, "audio-speakers"
+
+    description = all_sinks[name]
+    if name != current:
+        set_default(name)
+    print(f"default output: {description}")
+    notify(cfg, args, "Audio output", description, icon)
+
+
+def list_sinks(objects, cfg):
+    all_sinks = sinks(objects)
+    current = default_sink(objects)
+    headset = headset_sink(all_sinks)
+    other = cfg.get("toggle", "other_sink").strip()
+    entries = sorted(all_sinks.items(), key=lambda kv: kv[1].lower())
+    for i, (name, description) in enumerate(entries, 1):
+        tags = [t for t, cond in (("default", name == current), ("headset", name == headset),
+                                  ("other", name == other)) if cond]
+        print(f"{i:2}. {description}{'  [' + ', '.join(tags) + ']' if tags else ''}\n    {name}")
+    if other and other not in all_sinks:
+        print(f"\nconfigured other output {other!r} isn't available right now")
+    return entries
+
+
+def set_other(choice, objects, cfg):
+    all_sinks = sinks(objects)
+    headset = headset_sink(all_sinks)
+    if choice is None:
+        entries = list_sinks(objects, cfg)
+        try:
+            choice = input("\noutput to toggle to (number or node name): ").strip()
+        except EOFError:
+            raise ToggleError("no choice given")
+    else:
+        entries = sorted(all_sinks.items(), key=lambda kv: kv[1].lower())
+
+    if choice.isdigit() and 1 <= int(choice) <= len(entries):
+        name = entries[int(choice) - 1][0]
+    elif choice in all_sinks:
+        name = choice
+    else:
+        raise ToggleError(f"{choice!r} isn't one of the listed outputs")
+    if name == headset:
+        raise ToggleError("that's the headset; pick the output to switch to instead")
+
+    save_other_sink(name)
+    print(f"saved: yowu-toggle will switch between the headset and {all_sinks[name]}")
+    print(f"       ({CONFIG_PATH})")
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p.add_argument("-q", "--quiet", action="store_true", help="no desktop notification")
+    sub = p.add_subparsers(dest="cmd")
+    sub.add_parser("toggle", help="switch to whichever output isn't the default (the default action)")
+    sub.add_parser("headset", help="make the headset the default output")
+    sub.add_parser("other", help="make the configured other output the default")
+    sub.add_parser("list", help="list audio outputs")
+    s = sub.add_parser("set-other", help="choose the non-headset output (interactive without NAME)")
+    s.add_argument("choice", nargs="?", metavar="NAME|NUMBER",
+                   help="node name, or its number in `yowu-toggle list`")
+    args = p.parse_args()
+
+    cfg = load_config()
+    try:
+        objects = pw_dump()
+        if args.cmd == "list":
+            list_sinks(objects, cfg)
+        elif args.cmd == "set-other":
+            set_other(args.choice, objects, cfg)
+        else:
+            switch(args.cmd or "toggle", objects, cfg, args)
+    except ToggleError as e:
+        notify(cfg, args, "Audio output", str(e), "dialog-error")
+        sys.exit(f"yowu-toggle: {e}")
+
+
+if __name__ == "__main__":
+    main()

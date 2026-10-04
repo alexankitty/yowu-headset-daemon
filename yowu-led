@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+"""Control the YOWU-SELKIRK-4GS headset LEDs over Bluetooth LE.
+
+Protocol (from the YOWU Android app, com.yowu.yowumobile): the headset abuses
+the standard Immediate Alert service (0x1802) / Alert Level characteristic
+(0x2a06) as a command pipe. LED frames are 11 bytes:
+
+    FC 04 01 06  MODE  R  G  B  BRIGHTNESS  SPEED  CHECKSUM
+
+    MODE 00         solid color R,G,B (brightness/speed 0)
+    MODE 01..05     effect (R,G,B 0), brightness 1..8, speed 1..13
+                    (speed byte is a period: 1 = fastest, 13 = slowest)
+    MODE 06 / 07    lights off / on
+    CHECKSUM        makes all bytes sum to 0 mod 256
+
+After each frame the headset notifies its state on the same characteristic
+(see describe()).
+
+Needs python-bleak. The headset must be powered on; it does not need to be
+paired.
+"""
+import argparse
+import asyncio
+import colorsys
+import contextlib
+import sys
+
+DEVICE_NAME = "YOWU-SELKIRK-4GS"
+SERVICE_UUID = "00001802-0000-1000-8000-00805f9b34fb"
+CHAR_UUID = "00002a06-0000-1000-8000-00805f9b34fb"
+
+HEADER = bytes([0xFC, 0x04, 0x01, 0x06])
+MODE_COLOR, MODE_OFF, MODE_ON = 0x00, 0x06, 0x07
+
+# name: (mode, default speed as the app's slider 1..13, higher = faster)
+EFFECTS = {
+    "natural": (1, 1),
+    "flash": (2, 11),
+    "breath": (3, 10),
+    "rhythm": (4, 13),
+    "yowu": (5, 13),
+}
+
+# The app's built-in color presets.
+COLORS = {
+    "blue": (0, 0, 255),
+    "red": (255, 0, 0),
+    "green": (0, 255, 0),
+    "peach": (255, 10, 21),
+    "orange": (255, 64, 0),
+    "wathet": (0, 160, 255),
+    "cyan": (0, 255, 112),
+    "white": (255, 255, 255),
+    "purple": (255, 0, 200),
+    "yellow": (255, 150, 0),
+}
+
+
+def frame(mode, r=0, g=0, b=0, brightness=0, speed=0):
+    body = HEADER + bytes([mode, r, g, b, brightness, speed])
+    return body + bytes([-sum(body) & 0xFF])
+
+
+def parse_color(text):
+    t = text.lower()
+    if t in COLORS:
+        return COLORS[t]
+    if t.startswith("#") and len(t) == 7:
+        return tuple(int(t[i:i + 2], 16) for i in (1, 3, 5))
+    parts = t.split(",")
+    if len(parts) == 3 and all(p.strip().isdigit() and int(p) <= 255 for p in parts):
+        return tuple(int(p) for p in parts)
+    raise argparse.ArgumentTypeError(
+        f"'{text}': use a preset ({', '.join(COLORS)}), #rrggbb or r,g,b")
+
+
+def int_range(lo, hi):
+    def parse(text):
+        v = int(text)
+        if not lo <= v <= hi:
+            raise argparse.ArgumentTypeError(f"must be {lo}..{hi}")
+        return v
+    return parse
+
+
+def dim(rgb, brightness):
+    """Scale an RGB color to brightness 1..8.
+
+    Solid colors have no brightness field (the byte is ignored in color and
+    natural mode), so brightness has to be baked into the color itself.
+    """
+    return tuple(round(c * brightness / 8) for c in rgb)
+
+
+def build(args):
+    """Return the list of frames to send for a one-shot command."""
+    if args.cmd == "on":
+        return [frame(MODE_ON)]
+    if args.cmd == "off":
+        return [frame(MODE_OFF)]
+    if args.cmd == "raw":
+        data = bytes.fromhex(args.hex)
+        return [data + bytes([-sum(data) & 0xFF]) if args.add_checksum else data]
+    if args.cmd == "color":
+        cmd = frame(MODE_COLOR, *dim(args.color, args.brightness))
+    elif args.cmd == "effect":
+        if args.effect == "natural" and args.brightness != 8:
+            print("note: the headset ignores brightness for the natural effect; use "
+                  f"'yowu-led color <color> -b {args.brightness}' for a dimmed solid color",
+                  file=sys.stderr)
+        mode, default_speed = EFFECTS[args.effect]
+        speed = args.speed if args.speed is not None else default_speed
+        cmd = frame(mode, brightness=args.brightness, speed=14 - speed)
+    else:
+        raise AssertionError(args.cmd)
+    # Like the app, only change color/effect with the lights on.
+    return [cmd] if args.no_on else [frame(MODE_ON), cmd]
+
+
+def describe(status):
+    """Decode the headset's status notification.
+
+    FC 03 01 05  STATE  R  G  B  00  CHECKSUM
+    STATE high nibble: 1 = lights on, 0 = off; low nibble: current effect.
+    R G B: the current solid color.
+    """
+    if len(status) < 9 or status[:4] != bytes([0xFC, 0x03, 0x01, 0x05]):
+        return f"status {status.hex(' ')}"
+    state = status[4]
+    names = {mode: name for name, (mode, _) in EFFECTS.items()}
+    effect = names.get(state & 0x0F, f"mode {state & 0x0F}")
+    r, g, b = status[5:8]
+    return (f"headset reports: lights {'on' if state >> 4 else 'off'}, "
+            f"effect {effect}, color #{r:02x}{g:02x}{b:02x}")
+
+
+async def prefer_le(device):
+    """Make BlueZ connect over LE rather than BR/EDR.
+
+    The headset is dual-mode. With the default PreferredBearer ("last-used")
+    BlueZ may pick BR/EDR, which fails with br-connection-key-missing because
+    the headset isn't paired over classic Bluetooth. The setting is per device
+    object and lost when BlueZ forgets the device, so set it on every run.
+    """
+    path = device.details.get("path") if isinstance(device.details, dict) else None
+    if not path:
+        return
+    from dbus_fast import BusType, Message, MessageType, Variant
+    from dbus_fast.aio import MessageBus
+
+    bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    try:
+        reply = await bus.call(Message(
+            destination="org.bluez", path=path,
+            interface="org.freedesktop.DBus.Properties", member="Set",
+            signature="ssv", body=["org.bluez.Device1", "PreferredBearer", Variant("s", "le")]))
+        if reply.message_type == MessageType.ERROR:
+            print(f"warning: could not set PreferredBearer=le: {reply.error_name} {reply.body}",
+                  file=sys.stderr)
+    finally:
+        bus.disconnect()
+
+
+async def find_device(args):
+    from bleak import BleakScanner
+
+    if args.address:
+        print(f"scanning for {args.address}...", file=sys.stderr)
+        device = await BleakScanner.find_device_by_address(args.address, timeout=args.timeout)
+    else:
+        print(f"scanning for {DEVICE_NAME}...", file=sys.stderr)
+        device = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=args.timeout)
+    if device is None:
+        raise LookupError(f"{args.address or DEVICE_NAME} not found; is the headset on?")
+    await prefer_le(device)
+    return device
+
+
+# Pause between connection attempts when retrying (--wait).
+RETRY_INTERVAL = 2.0
+
+
+class ConnectFailed(Exception):
+    pass
+
+
+async def connect_once(device, timeout):
+    """Ask BlueZ for exactly one LE connection attempt. Returns None or an error.
+
+    bleak's own connect() re-dials immediately and indefinitely whenever the
+    attempt fails with le-connection-abort-by-local (HCI 0x3e, the headset not
+    answering), which floods the headset with connect/disconnect cycles while
+    its BLE side is still busy. Calling Device1.Connect ourselves gives a single
+    attempt; once it succeeds, bleak sees the device is connected and attaches
+    without dialling again.
+    """
+    from dbus_fast import BusType, Message, MessageType
+    from dbus_fast.aio import MessageBus
+
+    path = device.details["path"]
+    bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    try:
+        call = Message(destination="org.bluez", path=path,
+                       interface="org.bluez.Device1", member="Connect")
+        try:
+            reply = await asyncio.wait_for(bus.call(call), timeout)
+        except asyncio.TimeoutError:
+            # Cancel the pending connection so it doesn't linger in the controller.
+            await bus.call(Message(destination="org.bluez", path=path,
+                                   interface="org.bluez.Device1", member="Disconnect"))
+            return "connection attempt timed out"
+        if reply.message_type == MessageType.ERROR:
+            detail = reply.body[0] if reply.body else ""
+            return f"connect failed: {detail or reply.error_name}"
+        return None
+    finally:
+        bus.disconnect()
+
+
+@contextlib.asynccontextmanager
+async def connected(args, on_disconnect=None):
+    """Connect to the headset and yield (client, characteristic).
+
+    One connection attempt per fresh advertisement, RETRY_INTERVAL seconds
+    apart, until --wait seconds have passed (default: one attempt). Raises
+    ConnectFailed.
+
+    After joining the dongle the headset advertises right away but ignores
+    connection requests for ~15-20 s. A healthy connection completes in under
+    2 s, so attempts are kept short (--connect-timeout) and frequent rather
+    than long: one stuck attempt used to burn 10 s past the moment the
+    headset became ready.
+    """
+    from bleak import BleakClient
+    from bleak.exc import BleakError
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + args.wait
+    while True:
+        try:
+            device = await find_device(args)
+            print(f"connecting to {device.address}...", file=sys.stderr)
+            err = await connect_once(device, args.connect_timeout)
+            if err is None:
+                # Give bleak's BlueZ object cache a moment to see Connected=true,
+                # otherwise it would dial again itself.
+                await asyncio.sleep(0.5)
+                client = BleakClient(device, timeout=5.0, disconnected_callback=on_disconnect)
+                await client.connect()
+                break
+        except LookupError as e:
+            err = str(e)
+        except (BleakError, asyncio.TimeoutError) as e:
+            err = f"connect failed: {e or 'timed out'}"
+        if loop.time() + RETRY_INTERVAL > deadline:
+            raise ConnectFailed(err)
+        print(f"{err}; retrying in {RETRY_INTERVAL:g}s", file=sys.stderr)
+        await asyncio.sleep(RETRY_INTERVAL)
+
+    try:
+        service = client.services.get_service(SERVICE_UUID)
+        char = service and service.get_characteristic(CHAR_UUID)
+        if char is None:
+            raise ConnectFailed("headset has no Alert Level characteristic; not a 4GS?")
+        yield client, char
+    finally:
+        await client.disconnect()
+
+
+async def send(frames, args):
+    async with connected(args) as (client, char):
+        replies = asyncio.Queue()
+        if "notify" in char.properties:
+            await client.start_notify(char, lambda _, data: replies.put_nowait(bytes(data)))
+
+        for data in frames:
+            await client.write_gatt_char(char, data, response="write" in char.properties)
+            print(f"sent {data.hex(' ')}", file=sys.stderr)
+            try:
+                print(describe(await asyncio.wait_for(replies.get(), 2.0)), file=sys.stderr)
+            except asyncio.TimeoutError:
+                print("no status reply from headset", file=sys.stderr)
+
+
+FLASH_WARNING = """\
+WARNING: 'cycle' can wear out the headset's flash memory.
+  The headset most likely saves its color on every change, so each update is
+  probably a write to its internal flash. At {fps:g} updates/s that is about
+  {per_hour} writes per hour; cheap flash is often rated for 10k-100k erase
+  cycles. Running this for long periods will likely kill the headset's
+  storage and may brick it. Use it for short sessions only, and prefer a low
+  --fps with a long --period. You have been warned.
+"""
+
+
+def cycle_color(t, args):
+    """color at time t (seconds) of a smooth hue rotation."""
+    h = (t / args.period) % 1.0
+    r, g, b = colorsys.hsv_to_rgb(h, args.saturation, args.brightness / 8)
+    return round(r * 255), round(g * 255), round(b * 255)
+
+
+async def cycle(args):
+    """Stream a smooth color cycle until interrupted, reconnecting as needed.
+
+    The firmware's own effects jump between colors with no fading, so the
+    fade is generated here: solid-color frames at --fps along a hue wheel.
+
+    WARNING: the headset most likely persists its color, so every frame is
+    probably a flash write. See FLASH_WARNING.
+    """
+    print(FLASH_WARNING.format(fps=args.fps, per_hour=round(args.fps * 3600)),
+          file=sys.stderr)
+    interval = 1.0 / args.fps
+    while True:
+        lost = asyncio.Event()
+        try:
+            async with connected(args, on_disconnect=lambda _: lost.set()) as (client, char):
+                response = "write" in char.properties
+                await client.write_gatt_char(char, frame(MODE_ON), response=response)
+                print(f"cycling: {args.period:g}s per rotation at {args.fps:g} fps "
+                      "(Ctrl-C to stop)", file=sys.stderr)
+                loop = asyncio.get_running_loop()
+                t0 = loop.time()
+                last = None
+                while not lost.is_set():
+                    rgb = cycle_color(loop.time() - t0, args)
+                    if rgb != last:
+                        await client.write_gatt_char(char, frame(MODE_COLOR, *rgb),
+                                                     response=response)
+                        last = rgb
+                    await asyncio.sleep(interval)
+        except ConnectFailed as e:
+            print(e, file=sys.stderr)
+        except Exception as e:  # BleakError and friends: the link dropped mid-write
+            print(f"connection error: {e}", file=sys.stderr)
+        print("lost the headset, reconnecting in 3s...", file=sys.stderr)
+        await asyncio.sleep(3)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p.add_argument("-a", "--address", help=f"BLE address (default: scan for {DEVICE_NAME})")
+    p.add_argument("-t", "--timeout", type=float, default=10.0,
+                   help="how long to scan for the headset (default 10)")
+    p.add_argument("--connect-timeout", type=float, default=4.0,
+                   help="give up on a single connection attempt after this long (default 4)")
+    p.add_argument("-w", "--wait", type=float, default=0.0,
+                   help=f"keep retrying every {RETRY_INTERVAL:g}s for up to this many seconds "
+                        "if the headset isn't reachable yet (default: try once)")
+    p.add_argument("-n", "--dry-run", action="store_true", help="print the frames, don't send")
+    p.add_argument("--no-on", action="store_true",
+                   help="don't turn the lights on before a color/effect change")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("on", help="turn LEDs on")
+    sub.add_parser("off", help="turn LEDs off")
+
+    c = sub.add_parser("color", help="solid color")
+    c.add_argument("color", type=parse_color, help=f"{'|'.join(COLORS)}, #rrggbb or r,g,b")
+    c.add_argument("-b", "--brightness", type=int_range(1, 8), default=8,
+                   help="1..8, scales the color (default 8)")
+
+    e = sub.add_parser("effect", help="lighting effect")
+    e.add_argument("effect", choices=EFFECTS)
+    e.add_argument("-b", "--brightness", type=int_range(1, 8), default=8, help="1..8 (default 8)")
+    e.add_argument("-s", "--speed", type=int_range(1, 13), help="1..13, higher is faster "
+                   "(default: the app's preset)")
+
+    y = sub.add_parser(
+        "cycle", help="smooth color cycle generated on this PC; WARNING: wears out the "
+        "headset's flash, short sessions only",
+        description="Smooth color cycle, streamed from this PC until Ctrl-C.\n\n"
+        + FLASH_WARNING.format(fps=10, per_hour=36000),
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    y.add_argument("-p", "--period", type=float, default=10.0,
+                   help="seconds per full rotation (default 10)")
+    y.add_argument("-f", "--fps", type=float, default=10.0,
+                   help="color updates per second, 1..20 (default 10)")
+    y.add_argument("-b", "--brightness", type=int_range(1, 8), default=8, help="1..8 (default 8)")
+    y.add_argument("--saturation", type=float, default=1.0, help="0..1 (default 1)")
+    y.add_argument("--i-know-this-wears-flash", action="store_true", dest="ack_flash_wear",
+                   help="required: confirm you've read the flash wear warning above")
+
+    r = sub.add_parser("raw", help="send arbitrary bytes (for experimenting)")
+    r.add_argument("hex", help="hex bytes, e.g. fc04010607")
+    r.add_argument("-c", "--add-checksum", action="store_true", help="append checksum byte")
+
+    args = p.parse_args()
+    if args.cmd == "cycle":
+        if not 1 <= args.fps <= 20:
+            p.error("--fps must be 1..20")
+        if not args.ack_flash_wear and not args.dry_run:
+            print(FLASH_WARNING.format(fps=args.fps, per_hour=round(args.fps * 3600)),
+                  file=sys.stderr)
+            sys.exit("refusing to start: re-run with --i-know-this-wears-flash "
+                     "to accept the risk")
+        if args.dry_run:
+            for i in range(int(args.period * args.fps)):
+                print(frame(MODE_COLOR, *cycle_color(i / args.fps, args)).hex(" "))
+            return
+        try:
+            asyncio.run(cycle(args))
+        except ImportError:
+            sys.exit("python-bleak is required: sudo pacman -S python-bleak")
+        except KeyboardInterrupt:
+            pass
+        return
+
+    frames = build(args)
+    if args.dry_run:
+        for data in frames:
+            print(data.hex(" "))
+        return
+    try:
+        asyncio.run(send(frames, args))
+    except ImportError:
+        sys.exit("python-bleak is required: sudo pacman -S python-bleak")
+    except ConnectFailed as e:
+        sys.exit(f"{e}; giving up (try -w to keep retrying, or switch the headset off and on)")
+
+
+if __name__ == "__main__":
+    main()

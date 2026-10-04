@@ -1,0 +1,38 @@
+# Maintainer: Alexandra <junkyardjackass@gmail.com>
+#
+# Builds from this checkout:  cd packaging/arch && makepkg -si
+# For the AUR, replace the local-tree logic below with a real source, e.g.
+#   source=("git+https://example.com/yowu-headset.git#tag=v$pkgver")
+# and cd into "$srcdir/$pkgname" instead of $_tree.
+
+pkgname=yowu-headset
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Audio fix daemon, output toggle and Bluetooth LE LED control for the YOWU-SELKIRK-4GS wireless headset'
+arch=('any')
+url='https://example.com/yowu-headset'  # TODO: set once the repo is published
+license=('LicenseRef-unknown')           # TODO: pick a license
+depends=('python' 'pipewire')            # pw-dump, pw-cli
+optdepends=(
+  'python-bleak: LED control (yowu-led and the [led] on_connect option)'
+  'bluez: LED control over Bluetooth LE'
+  'libnotify: desktop notifications from yowu-toggle'
+  'wireplumber: moves playing streams when yowu-toggle changes the default output'
+)
+makedepends=('make')
+backup=('etc/yowu-headset/headsetd.conf')
+install=yowu-headset.install
+
+# The repository root, two levels up from this PKGBUILD.
+_tree="$(realpath "$startdir/../..")"
+
+build() {
+  make -C "$_tree" clean all \
+    PREFIX=/usr UDEVRULESDIR=/usr/lib/udev/rules.d
+}
+
+package() {
+  make -C "$_tree" install DESTDIR="$pkgdir" \
+    PREFIX=/usr UDEVRULESDIR=/usr/lib/udev/rules.d
+  make -C "$_tree" clean
+}

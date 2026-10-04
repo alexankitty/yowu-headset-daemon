@@ -1,0 +1,36 @@
+# yowu-headsetd configuration.
+#
+# Read from /etc/yowu-headset/headsetd.conf (system-wide), then
+# ~/.config/yowu-headset/headsetd.conf, whose settings take precedence.
+# Command-line flags override both. Apply changes with
+#   systemctl --user restart yowu-headsetd
+
+[audio]
+# Seconds to wait after the headset link is established before restarting the
+# audio stream. Raise this if audio sometimes still comes up silent.
+delay = 0.5
+
+[led]
+# yowu-led command to run (over Bluetooth LE) after the headset connects to the
+# dongle, e.g.:
+#   on_connect = off
+#   on_connect = color purple
+#   on_connect = effect breath -b 3
+# Only on, off, color and effect are allowed. Empty = leave the LEDs alone.
+on_connect =
+# BLE address of the headset. Empty = scan for YOWU-SELKIRK-4GS.
+address =
+# The headset advertises right after joining the dongle, but only accepts BLE
+# connections ~15-20 s later. Seconds to wait after the link is established
+# before the first attempt:
+delay = 5
+# Seconds to keep retrying after that. Each attempt is a single connection
+# attempt of at most 4 s, 2 s apart, so this doesn't flood the headset.
+timeout = 90
+
+[toggle]
+# Non-headset output that yowu-toggle switches to: a PipeWire node.name, as
+# shown by `yowu-toggle list`. Easiest to set with `yowu-toggle set-other`.
+other_sink =
+# Show a desktop notification (notify-send) on each switch.
+notify = true

@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""Restart the YOWU-4GS audio stream whenever the wireless headset (re)connects.
+
+The dongle (1908:5566) only forwards audio to the headset if the USB audio
+stream is started *after* the radio link is up. Under PipeWire the stream is
+usually already running when the headset is switched on, so the headset stays
+silent (or comes up with a skewed L/R balance) until the stream is restarted.
+
+The dongle reports link state on its vendor HID interface (if04):
+
+    12 00 00 01 00 ...            headset disconnected
+    12 00 00 01 01 ...            radio link up
+    12 00 00 00 00 01 00 01 ...   link established (~2.5 s after link up)
+
+On "link established", if the YOWU sink is active, we send its PipeWire node
+a Suspend command. PipeWire stops the ALSA stream and immediately restarts it
+(~20 ms), so the dongle sees a fresh stream start with the link already up:
+the same thing the manual `pactl suspend-sink` workaround did, but once, at the
+right moment, and natively. A suspended sink is left alone, because the next
+playback starts a fresh stream anyway.
+
+Optionally, a few seconds after "link established" it also runs a yowu-led
+command (e.g. "off") to set the headset's LEDs over Bluetooth LE. The headset's
+BLE side comes up later than the dongle link, so yowu-led is told to keep
+retrying for a while. See headsetd.conf.example.
+"""
+import argparse
+import configparser
+import glob
+import json
+import os
+import select
+import shlex
+import shutil
+import subprocess
+import time
+
+HIDRAW_GLOB = "/dev/input/by-id/usb-YOWU_YOWU-4GS_*-if04-hidraw"
+SINK_PREFIX = "alsa_output.usb-YOWU_YOWU-4GS_"
+
+MSG_TYPE = 0x12
+# If the "established" report never arrives after link up, restart anyway.
+LINK_UP_FALLBACK = 5.0
+
+SYSTEM_CONFIG_PATH = "/etc/yowu-headset/headsetd.conf"
+CONFIG_PATH = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                           "yowu-headset", "headsetd.conf")
+DEFAULTS = {
+    "audio": {"delay": "0.5"},
+    "led": {"on_connect": "", "address": "", "delay": "5", "timeout": "90"},
+}
+# One-shot yowu-led commands allowed in [led] on_connect. Not "cycle": it never
+# exits and wears out the headset's flash.
+LED_COMMANDS = {"on", "off", "color", "effect"}
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def find_hidraw():
+    paths = sorted(glob.glob(HIDRAW_GLOB))
+    return os.path.realpath(paths[0]) if paths else None
+
+
+def find_sinks():
+    """Return [(node id, node.name, state)] for the YOWU PipeWire sink(s)."""
+    try:
+        out = subprocess.run(["pw-dump"], capture_output=True, text=True, check=True).stdout
+        objects = json.loads(out)
+    except (OSError, subprocess.CalledProcessError, ValueError) as e:
+        log(f"pw-dump failed: {e}")
+        return []
+    sinks = []
+    for obj in objects:
+        if obj.get("type") != "PipeWire:Interface:Node":
+            continue
+        info = obj.get("info") or {}
+        props = info.get("props") or {}
+        name = props.get("node.name", "")
+        if name.startswith(SINK_PREFIX) and props.get("media.class") == "Audio/Sink":
+            sinks.append((obj["id"], name, info.get("state")))
+    return sinks
+
+
+def restart_stream(args):
+    sinks = find_sinks()
+    if not sinks:
+        log("no YOWU sink in PipeWire, nothing to restart")
+        return
+    for node_id, name, state in sinks:
+        if state == "suspended":
+            log(f"{name} is suspended, nothing to restart "
+                "(the next playback starts a fresh stream)")
+            continue
+        log(f"restarting stream on {name} (node {node_id}, {state})")
+        if args.dry_run:
+            continue
+        # PipeWire stops the ALSA stream and, with clients still linked,
+        # restarts it right away; no explicit resume is needed.
+        r = subprocess.run(["pw-cli", "send-command", str(node_id), "Suspend", "{}"],
+                           capture_output=True, text=True)
+        if r.returncode != 0 or "Error" in r.stdout + r.stderr:
+            log(f"pw-cli send-command failed: {(r.stderr or r.stdout).strip()}")
+
+
+def find_yowu_led():
+    """Prefer the yowu-led installed next to this script, then $PATH."""
+    here = os.path.join(os.path.dirname(os.path.realpath(__file__)), "yowu-led")
+    return here if os.access(here, os.X_OK) else shutil.which("yowu-led")
+
+
+class LedOnConnect:
+    """Runs the configured yowu-led command in the background on connect."""
+
+    def __init__(self, args):
+        self.args = args
+        self.proc = None
+
+    def running(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def stop(self):
+        """Give up on a pending LED command, e.g. because the headset went away."""
+        if self.running():
+            log("LEDs: headset gone, stopping yowu-led")
+            self.proc.terminate()
+            try:
+                self.proc.wait(5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+
+    def __call__(self):
+        if not self.args.led_cmd:
+            return
+        if self.running():
+            log("previous LED command still running, skipping")
+            return
+        cmd = [self.args.yowu_led, "-w", f"{self.args.led_timeout:g}"]
+        if self.args.led_address:
+            cmd += ["-a", self.args.led_address]
+        cmd += self.args.led_cmd
+        log(f"LEDs: running {shlex.join(cmd[1:])}")
+        if self.args.dry_run:
+            return
+        # Output goes straight to our stdout, i.e. the journal.
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
+
+
+def classify(report):
+    """Return 'down', 'up', 'ready' or None for a 64-byte if04 report."""
+    if len(report) < 6 or report[0] != MSG_TYPE:
+        return None
+    if report[3] == 0x01:
+        return "up" if report[4] == 0x01 else "down"
+    if report[3] == 0x00 and report[5] == 0x01:
+        return "ready"
+    return None
+
+
+def run(fd, args, led):
+    """Process reports until the device goes away."""
+    pending = None      # monotonic deadline for the next stream restart
+    led_pending = None  # monotonic deadline for the LED command
+    poller = select.poll()
+    poller.register(fd, select.POLLIN)
+
+    while True:
+        deadlines = [t for t in (pending, led_pending) if t is not None]
+        timeout = None
+        if deadlines:
+            timeout = max(0, int((min(deadlines) - time.monotonic()) * 1000))
+        events = poller.poll(timeout)
+
+        now = time.monotonic()
+        if pending is not None and now >= pending:
+            pending = None
+            restart_stream(args)
+        if led_pending is not None and now >= led_pending:
+            led_pending = None
+            led()
+        if not events:
+            continue
+
+        for _, ev in events:
+            if ev & (select.POLLERR | select.POLLHUP | select.POLLNVAL):
+                return
+            try:
+                report = os.read(fd, 64)
+            except OSError:
+                return
+            if not report:
+                return
+
+            kind = classify(report)
+            if args.verbose or kind is None:
+                log(f"report: {report.hex(' ')}")
+            if kind == "down":
+                log("headset disconnected")
+                pending = led_pending = None
+                led.stop()
+            elif kind == "up":
+                log("headset link up, waiting for it to settle")
+                pending = time.monotonic() + LINK_UP_FALLBACK
+                if args.led_cmd:
+                    # Rescheduled from "ready"; this only matters if that never arrives.
+                    led_pending = pending + args.led_delay
+            elif kind == "ready":
+                log(f"headset connected, restarting stream in {args.delay:g}s")
+                pending = time.monotonic() + args.delay
+                if args.led_cmd:
+                    log(f"LEDs: will run in {args.led_delay:g}s")
+                    led_pending = time.monotonic() + args.led_delay
+
+
+def load_config(p, args):
+    """Merge config files into args; command-line flags win.
+
+    Without -c, /etc/yowu-headset/headsetd.conf is read first and the user's
+    ~/.config/yowu-headset/headsetd.conf overrides it, setting by setting.
+    """
+    cfg = configparser.ConfigParser()
+    cfg.read_dict(DEFAULTS)
+    if args.config is None:
+        files = [SYSTEM_CONFIG_PATH, CONFIG_PATH]
+    elif os.path.exists(args.config):
+        files = [args.config]
+    else:
+        p.error(f"config file {args.config} not found")
+    try:
+        cfg.read(files)
+        if args.delay is None:
+            args.delay = cfg.getfloat("audio", "delay")
+        if args.led_on_connect is None:
+            args.led_on_connect = cfg.get("led", "on_connect")
+        args.led_address = cfg.get("led", "address").strip()
+        args.led_delay = cfg.getfloat("led", "delay")
+        args.led_timeout = cfg.getfloat("led", "timeout")
+    except (configparser.Error, ValueError) as e:
+        p.error(f"config: {e}")
+
+    args.led_cmd = shlex.split(args.led_on_connect)
+    if args.led_cmd:
+        if args.led_cmd[0] not in LED_COMMANDS:
+            p.error(f"[led] on_connect must start with one of {', '.join(sorted(LED_COMMANDS))}, "
+                    f"not {args.led_cmd[0]!r}")
+        args.yowu_led = find_yowu_led()
+        if not args.yowu_led:
+            p.error("[led] on_connect is set but yowu-led was not found")
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p.add_argument("-c", "--config",
+                   help=f"read only this config file (default: {SYSTEM_CONFIG_PATH}, "
+                        f"then {CONFIG_PATH})")
+    p.add_argument("--device", help="hidraw node (default: autodetect if04)")
+    p.add_argument("--delay", type=float,
+                   help="seconds to wait after the link is established (default 0.5)")
+    p.add_argument("--led-on-connect", metavar="CMD",
+                   help="yowu-led command to run when the headset connects, e.g. 'off' "
+                        "(overrides the config; '' disables)")
+    p.add_argument("--dry-run", action="store_true", help="log instead of acting")
+    p.add_argument("-v", "--verbose", action="store_true", help="log every report")
+    args = p.parse_args()
+    load_config(p, args)
+    led = LedOnConnect(args)
+    if args.led_cmd:
+        log(f"will run 'yowu-led {shlex.join(args.led_cmd)}' when the headset connects")
+
+    waiting = False
+    while True:
+        path = args.device or find_hidraw()
+        if not path or not os.path.exists(path):
+            if not waiting:
+                log("waiting for YOWU-4GS dongle")
+                waiting = True
+            time.sleep(2)
+            continue
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except PermissionError:
+            # Right after a replug udev creates the symlink before it applies
+            # the uaccess ACL, so this is usually transient.
+            if not waiting:
+                log(f"cannot open {path} yet (permission denied); if this persists, "
+                    "install udev/70-yowu-headset.rules and replug the dongle")
+                waiting = True
+            time.sleep(1)
+            continue
+        except OSError as e:
+            log(f"cannot open {path}: {e}")
+            time.sleep(2)
+            continue
+
+        log(f"listening on {path}")
+        waiting = False
+        try:
+            run(fd, args, led)
+        finally:
+            os.close(fd)
+            led.stop()
+        log("dongle disappeared")
+        if args.device:
+            return
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
