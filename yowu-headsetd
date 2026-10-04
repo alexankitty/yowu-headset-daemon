@@ -19,8 +19,10 @@ the same thing the manual `pactl suspend-sink` workaround did, but once, at the
 right moment, and natively. A suspended sink is left alone, because the next
 playback starts a fresh stream anyway.
 
-Optionally, a few seconds after "link established" it also runs a yowu-led
-command (e.g. "off") to set the headset's LEDs over Bluetooth LE. The headset's
+Optionally it also makes the headset the default output when it connects and
+switches back to another output when it disconnects (via yowu-toggle), and a
+few seconds after "link established" runs a yowu-led command (e.g. "off") to
+set the headset's LEDs over Bluetooth LE. The headset's
 BLE side comes up later than the dongle link, so yowu-led is told to keep
 retrying for a while. See headsetd.conf.example.
 """
@@ -48,6 +50,7 @@ CONFIG_PATH = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expandus
 DEFAULTS = {
     "audio": {"delay": "0.5"},
     "led": {"on_connect": "", "address": "", "delay": "5", "timeout": "90"},
+    "toggle": {"other_sink": "", "switch_on_connect": "false", "switch_on_disconnect": "false"},
 }
 # One-shot yowu-led commands allowed in [led] on_connect. Not "cycle": it never
 # exits and wears out the headset's flash.
@@ -104,10 +107,30 @@ def restart_stream(args):
             log(f"pw-cli send-command failed: {(r.stderr or r.stdout).strip()}")
 
 
-def find_yowu_led():
-    """Prefer the yowu-led installed next to this script, then $PATH."""
-    here = os.path.join(os.path.dirname(os.path.realpath(__file__)), "yowu-led")
-    return here if os.access(here, os.X_OK) else shutil.which("yowu-led")
+def find_tool(name):
+    """Prefer the tool installed next to this script, then $PATH."""
+    here = os.path.join(os.path.dirname(os.path.realpath(__file__)), name)
+    return here if os.access(here, os.X_OK) else shutil.which(name)
+
+
+def switch_default(args, target):
+    """Make the headset ("headset") or the configured other output ("other") the
+    default via yowu-toggle. Switching away only happens if the headset is
+    currently the default, so a deliberate choice of another output sticks."""
+    cmd = [args.yowu_toggle]
+    if target == "other":
+        cmd.append("--only-if-headset")
+    cmd.append(target)
+    log(f"default output: running {shlex.join(cmd[1:])}")
+    if args.dry_run:
+        return
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"yowu-toggle failed: {e}")
+        return
+    for line in (r.stdout + r.stderr).splitlines():
+        log(f"  {line}")
 
 
 class LedOnConnect:
@@ -163,6 +186,7 @@ def run(fd, args, led):
     """Process reports until the device goes away."""
     pending = None      # monotonic deadline for the next stream restart
     led_pending = None  # monotonic deadline for the LED command
+    switched = True     # whether this connection's default-output switch has run
     poller = select.poll()
     poller.register(fd, select.POLLIN)
 
@@ -176,6 +200,9 @@ def run(fd, args, led):
         now = time.monotonic()
         if pending is not None and now >= pending:
             pending = None
+            if not switched:  # "established" never arrived
+                switched = True
+                switch_default(args, "headset")
             restart_stream(args)
         if led_pending is not None and now >= led_pending:
             led_pending = None
@@ -199,16 +226,25 @@ def run(fd, args, led):
             if kind == "down":
                 log("headset disconnected")
                 pending = led_pending = None
+                switched = True
                 led.stop()
+                if args.switch_on_disconnect:
+                    switch_default(args, "other")
             elif kind == "up":
                 log("headset link up, waiting for it to settle")
                 pending = time.monotonic() + LINK_UP_FALLBACK
+                switched = not args.switch_on_connect
                 if args.led_cmd:
                     # Rescheduled from "ready"; this only matters if that never arrives.
                     led_pending = pending + args.led_delay
             elif kind == "ready":
                 log(f"headset connected, restarting stream in {args.delay:g}s")
                 pending = time.monotonic() + args.delay
+                if not switched:
+                    # Moving streams onto the headset starts them fresh too;
+                    # the restart above still covers anything already there.
+                    switched = True
+                    switch_default(args, "headset")
                 if args.led_cmd:
                     log(f"LEDs: will run in {args.led_delay:g}s")
                     led_pending = time.monotonic() + args.led_delay
@@ -237,6 +273,9 @@ def load_config(p, args):
         args.led_address = cfg.get("led", "address").strip()
         args.led_delay = cfg.getfloat("led", "delay")
         args.led_timeout = cfg.getfloat("led", "timeout")
+        args.switch_on_connect = cfg.getboolean("toggle", "switch_on_connect")
+        args.switch_on_disconnect = cfg.getboolean("toggle", "switch_on_disconnect")
+        other_sink = cfg.get("toggle", "other_sink").strip()
     except (configparser.Error, ValueError) as e:
         p.error(f"config: {e}")
 
@@ -245,9 +284,18 @@ def load_config(p, args):
         if args.led_cmd[0] not in LED_COMMANDS:
             p.error(f"[led] on_connect must start with one of {', '.join(sorted(LED_COMMANDS))}, "
                     f"not {args.led_cmd[0]!r}")
-        args.yowu_led = find_yowu_led()
+        args.yowu_led = find_tool("yowu-led")
         if not args.yowu_led:
             p.error("[led] on_connect is set but yowu-led was not found")
+
+    if args.switch_on_connect or args.switch_on_disconnect:
+        args.yowu_toggle = find_tool("yowu-toggle")
+        if not args.yowu_toggle:
+            p.error("[toggle] switch_on_connect/switch_on_disconnect is set but yowu-toggle "
+                    "was not found")
+        if args.switch_on_disconnect and not other_sink:
+            log("warning: [toggle] switch_on_disconnect is set but other_sink isn't; "
+                "run 'yowu-toggle set-other'")
 
 
 def main():
@@ -268,6 +316,10 @@ def main():
     led = LedOnConnect(args)
     if args.led_cmd:
         log(f"will run 'yowu-led {shlex.join(args.led_cmd)}' when the headset connects")
+    if args.switch_on_connect:
+        log("will make the headset the default output when it connects")
+    if args.switch_on_disconnect:
+        log("will switch the default output away from the headset when it disconnects")
 
     waiting = False
     while True:
@@ -302,6 +354,8 @@ def main():
             os.close(fd)
             led.stop()
         log("dongle disappeared")
+        if args.switch_on_disconnect:
+            switch_default(args, "other")
         if args.device:
             return
 

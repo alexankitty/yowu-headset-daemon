@@ -48,13 +48,17 @@ def sinks(objects):
     return result
 
 
-def default_sink(objects):
-    """node.name of the current default output, or None."""
+def default_sink(objects, key="default.audio.sink"):
+    """node.name of the current default output, or None.
+
+    default.audio.sink is the effective default; default.configured.audio.sink
+    is the one the user chose, which survives the output disappearing.
+    """
     for obj in objects:
         if (obj.get("type") == "PipeWire:Interface:Metadata"
                 and (obj.get("props") or {}).get("metadata.name") == "default"):
             for entry in obj.get("metadata") or []:
-                if entry.get("key") == "default.audio.sink":
+                if entry.get("key") == key:
                     value = entry.get("value")
                     if isinstance(value, str):
                         value = json.loads(value)
@@ -128,6 +132,14 @@ def switch(target, objects, cfg, args):
     other = cfg.get("toggle", "other_sink").strip()
     current = default_sink(objects)
 
+    if args.only_if_headset:
+        # Check the configured default too: when the dongle is unplugged the
+        # effective default has usually already fallen back elsewhere.
+        chosen = default_sink(objects, "default.configured.audio.sink")
+        if not any((n or "").startswith(HEADSET_PREFIX) for n in (current, chosen)):
+            print("default output isn't the headset, leaving it alone")
+            return
+
     if target == "toggle":
         target = "other" if current == headset and headset else "headset"
 
@@ -143,8 +155,10 @@ def switch(target, objects, cfg, args):
         name, icon = other, "audio-speakers"
 
     description = all_sinks[name]
-    if name != current:
-        set_default(name)
+    if name == current:
+        print(f"default output is already {description}")
+        return
+    set_default(name)
     print(f"default output: {description}")
     notify(cfg, args, "Audio output", description, icon)
 
@@ -193,6 +207,9 @@ def set_other(choice, objects, cfg):
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("-q", "--quiet", action="store_true", help="no desktop notification")
+    p.add_argument("--only-if-headset", action="store_true",
+                   help="do nothing unless the headset is the current or chosen default "
+                        "(used by yowu-headsetd on disconnect)")
     sub = p.add_subparsers(dest="cmd")
     sub.add_parser("toggle", help="switch to whichever output isn't the default (the default action)")
     sub.add_parser("headset", help="make the headset the default output")

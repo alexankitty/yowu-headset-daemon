@@ -221,6 +221,26 @@ yowu-toggle list          # all outputs, with the default/headset/other marked
   set-default` uses). WirePlumber then moves the streams that follow the
   default output, and remembers the choice across restarts.
 
+### Switching automatically
+
+`yowu-headsetd` can switch the default for you:
+
+```ini
+[toggle]
+# set with yowu-toggle set-other
+other_sink = alsa_output.pci-0000_00_1f.3.analog-stereo
+# headset becomes the default when it connects
+switch_on_connect = true
+# other_sink becomes the default when it disconnects
+switch_on_disconnect = true
+```
+
+The connect switch happens at "link established", alongside the stream
+restart. The disconnect switch also fires when the dongle is unplugged. It
+only applies while the headset is the default (`yowu-toggle
+--only-if-headset`), so if you had moved to another output yourself, it's left
+alone. Both are off by default.
+
 Switching away and back is also the manual fix for the skewed-balance problem
 described above, so this doubles as a one-key workaround if it ever comes up
 again.

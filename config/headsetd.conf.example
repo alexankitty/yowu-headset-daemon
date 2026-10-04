@@ -34,3 +34,9 @@ timeout = 90
 other_sink =
 # Show a desktop notification (notify-send) on each switch.
 notify = true
+# Make the headset the default output when it connects (yowu-headsetd).
+switch_on_connect = false
+# Switch to other_sink when the headset disconnects or the dongle is unplugged
+# (yowu-headsetd). Only happens while the headset is the default, so choosing
+# another output yourself sticks.
+switch_on_disconnect = false
