@@ -32,7 +32,7 @@ install: all
 	install -Dm755 -t $(DESTDIR)$(BINDIR) $(addprefix build/,$(BIN))
 	install -Dm644 udev/70-yowu-headset.rules $(DESTDIR)$(UDEVRULESDIR)/70-yowu-headset.rules
 	install -Dm644 build/yowu-headsetd.service $(DESTDIR)$(USERUNITDIR)/yowu-headsetd.service
-	install -Dm644 -t $(DESTDIR)$(DOCDIR) README.md docs/PROTOCOL.md config/headsetd.conf.example
+	install -Dm644 -t $(DESTDIR)$(DOCDIR) README.md docs/INSTALL.md docs/PROTOCOL.md config/headsetd.conf.example
 	@# never overwrite an existing system config
 	test -e $(CONF) || install -Dm644 config/headsetd.conf.example $(CONF)
 
