@@ -184,8 +184,28 @@ class ConnectFailed(Exception):
     pass
 
 
+async def bluez_call(path, member):
+    """Call a no-argument org.bluez.Device1 method. Never raises."""
+    from dbus_fast import BusType, Message
+    from dbus_fast.aio import MessageBus
+    try:
+        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    except Exception as e:
+        return f"can't reach BlueZ over D-Bus: {e}"
+    try:
+        reply = await bus.call(Message(destination="org.bluez", path=path,
+                                       interface="org.bluez.Device1", member=member))
+        return reply
+    except Exception as e:
+        return str(e)
+    finally:
+        with contextlib.suppress(Exception):
+            bus.disconnect()
+
+
 async def connect_once(device, timeout):
-    """Ask BlueZ for exactly one LE connection attempt. Returns None or an error.
+    """Ask BlueZ for exactly one LE connection attempt. Returns None or an error
+    string; never raises.
 
     bleak's own connect() re-dials immediately and indefinitely whenever the
     attempt fails with le-connection-abort-by-local (HCI 0x3e, the headset not
@@ -194,11 +214,17 @@ async def connect_once(device, timeout):
     attempt; once it succeeds, bleak sees the device is connected and attaches
     without dialling again.
     """
-    from dbus_fast import BusType, Message, MessageType
+    from dbus_fast import MessageType
+    try:
+        path = device.details["path"]
+    except (KeyError, TypeError):
+        return "device has no D-Bus path"
+    from dbus_fast import BusType, Message
     from dbus_fast.aio import MessageBus
-
-    path = device.details["path"]
-    bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    try:
+        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    except Exception as e:
+        return f"can't reach BlueZ over D-Bus: {e}"
     try:
         call = Message(destination="org.bluez", path=path,
                        interface="org.bluez.Device1", member="Connect")
@@ -206,15 +232,24 @@ async def connect_once(device, timeout):
             reply = await asyncio.wait_for(bus.call(call), timeout)
         except asyncio.TimeoutError:
             # Cancel the pending connection so it doesn't linger in the controller.
-            await bus.call(Message(destination="org.bluez", path=path,
-                                   interface="org.bluez.Device1", member="Disconnect"))
+            await bluez_disconnect(device)
             return "connection attempt timed out"
+        except Exception as e:
+            return f"connect failed: {e}"
         if reply.message_type == MessageType.ERROR:
             detail = reply.body[0] if reply.body else ""
             return f"connect failed: {detail or reply.error_name}"
         return None
     finally:
-        bus.disconnect()
+        with contextlib.suppress(Exception):
+            bus.disconnect()
+
+
+async def bluez_disconnect(device):
+    """Tell BlueZ to drop the device, clearing any half-open connection."""
+    path = (device.details or {}).get("path") if isinstance(device.details, dict) else None
+    if path:
+        await bluez_call(path, "Disconnect")
 
 
 @contextlib.asynccontextmanager
@@ -246,7 +281,14 @@ async def connected(args, on_disconnect=None):
                 # otherwise it would dial again itself.
                 await asyncio.sleep(0.5)
                 client = BleakClient(device, timeout=5.0, disconnected_callback=on_disconnect)
-                await client.connect()
+                try:
+                    await client.connect()
+                except (BleakError, asyncio.TimeoutError):
+                    # The link dropped between Connect and setup. Clear BlueZ's
+                    # half-open device so the next attempt starts clean instead
+                    # of churning connect/disconnect.
+                    await bluez_disconnect(device)
+                    raise
                 break
         except LookupError as e:
             err = str(e)
@@ -268,18 +310,25 @@ async def connected(args, on_disconnect=None):
 
 
 async def send(frames, args):
-    async with connected(args) as (client, char):
-        replies = asyncio.Queue()
-        if "notify" in char.properties:
-            await client.start_notify(char, lambda _, data: replies.put_nowait(bytes(data)))
+    from bleak.exc import BleakError
 
-        for data in frames:
-            await client.write_gatt_char(char, data, response="write" in char.properties)
-            print(f"sent {data.hex(' ')}", file=sys.stderr)
-            try:
-                print(describe(await asyncio.wait_for(replies.get(), 2.0)), file=sys.stderr)
-            except asyncio.TimeoutError:
-                print("no status reply from headset", file=sys.stderr)
+    try:
+        async with connected(args) as (client, char):
+            replies = asyncio.Queue()
+            if "notify" in char.properties:
+                await client.start_notify(char, lambda _, data: replies.put_nowait(bytes(data)))
+
+            for data in frames:
+                await client.write_gatt_char(char, data, response="write" in char.properties)
+                print(f"sent {data.hex(' ')}", file=sys.stderr)
+                try:
+                    print(describe(await asyncio.wait_for(replies.get(), 2.0)), file=sys.stderr)
+                except asyncio.TimeoutError:
+                    print("no status reply from headset", file=sys.stderr)
+    except (BleakError, asyncio.TimeoutError) as e:
+        # The headset dropped between connecting and writing (e.g. it was turned
+        # off just as we reached it). Fail cleanly instead of dumping a traceback.
+        raise ConnectFailed(f"lost the connection while sending: {e or 'disconnected'}")
 
 
 FLASH_WARNING = """\
